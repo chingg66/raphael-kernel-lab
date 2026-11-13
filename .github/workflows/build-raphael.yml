@@ -527,6 +527,15 @@ jobs:
           # gives mq-deadline and kyber, the two that actually suit flash.
           CONFIG_MQ_IOSCHED_DEADLINE=y
           CONFIG_MQ_IOSCHED_KYBER=y
+          # --- SCSI blk-mq: without it sda never offers the mq schedulers ---
+          # On -feat1b both "io scheduler mq-deadline registered" and "kyber
+          # registered" appear in dmesg, yet /sys/block/sda/queue/scheduler is
+          # still "noop [cfq]" and /sys/block/sda/mq does not exist. sda is on
+          # the LEGACY elevator path, so the two mq schedulers can register but
+          # can never attach. SCSI_MQ_DEFAULT flips scsi_mod.use_blk_mq's
+          # default to Y (drivers/scsi/Kconfig), which puts the UFS queue on
+          # blk-mq and makes mq-deadline/kyber selectable at runtime.
+          CONFIG_SCSI_MQ_DEFAULT=y
           # --- BPF_EVENTS: required or Android will not boot on this kernel ---
           # bpfloader is a `critical` init service. When it fails, init reboots
           # and records `reboot,bpfloader-failed` in
