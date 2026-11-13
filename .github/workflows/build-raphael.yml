@@ -1,4 +1,4 @@
-﻿name: Build Raphael Kernel (Docker-enabled)
+name: Build Raphael Kernel (Docker-enabled)
 
 # Cloud replacement for the local Docker build (run_builder_soviet.sh +
 # scripts/build_kernel_soviet_docker.sh). Same recipe, no local Docker/exFAT/
@@ -426,6 +426,13 @@ jobs:
           # ("redefinition of 'dd'"). We want the scheduler, not the compile
           # error -- drop the one stray line. See scripts/fix_mq_deadline.py.
           python3 "$GITHUB_WORKSPACE/scripts/fix_mq_deadline.py"
+
+          # vm_table[] registers swappiness / vfs_cache_pressure /
+          # watermark_scale_factor with .mode = 0444. procfs validates sysctl
+          # writes in test_perm(), which shifts the mode by the effective uid and
+          # ignores CAP_DAC_OVERRIDE -- so even uid 0 gets EACCES and no
+          # userspace tuner can ever touch them. Rebuild the table with 0644.
+          python3 "$GITHUB_WORKSPACE/scripts/fix_sysctl_mode.py"
 
           # Assert the patches we asked for actually landed. Three times a
           # patch script has reported "applied" while changing nothing, and the
