@@ -474,6 +474,15 @@ jobs:
           CONFIG_LITTLE_CPU_MASK=15
           CONFIG_BIG_CPU_MASK=112
           CONFIG_PRIME_CPU_MASK=128
+          # --- LLVM_POLLY: raphael_defconfig turns it ON and the build HANGS ---
+          # Polly's ISL solver is exponential worst-case; qca-wifi-host-cmn's
+          # reg_build_chan_list.c (1245 lines) ran 20+ min at 99% CPU and never
+          # finished. Turning the Kconfig symbol off removes all 8 -polly flags
+          # in Makefile:763 -- no source patch needed.
+          # This MUST live in the always-applied fragment, not docker.config:
+          # stock_only builds skip docker.config, POLLY stays on, and the
+          # pre-build gate below aborts (run 43440904862 died exactly there).
+          # CONFIG_LLVM_POLLY is not set
           # --- PSTORE: without this a failed boot is SILENT ---
           # Rikka's raphael_defconfig ships no PSTORE symbols at all, so two
           # Rikka test boots wrote nothing to ramoops and looked like a DT bug
