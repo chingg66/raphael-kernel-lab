@@ -1,0 +1,666 @@
+name: Build Raphael Kernel (Docker-enabled)
+
+# Cloud replacement for the local Docker build (run_builder_soviet.sh +
+# scripts/build_kernel_soviet_docker.sh). Same recipe, no local Docker/exFAT/
+# sparse-image dance: clone SOVIET source -> AOSP Clang r522817 -> raphael_defconfig
+# + merge this repo's docker.config -> Image.gz-dtb -> AnyKernel3 zip.
+
+permissions:
+  contents: read
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo'
+        required: false
+        type: string
+        default: 'https://github.com/SOVIET-ANDROID/kernel_xiaomi_raphael.git'
+      kernel_branch:
+        description: 'Kernel branch (16.0 = Android 16, 4.14.357, KernelSU-Next in-tree)'
+        required: false
+        type: string
+        default: '16.0'
+      defconfig:
+        description: 'Defconfig in the kernel tree, OR a config file committed in this repo (e.g. kameos_defconfig) which is then layered over tree_defconfig'
+        required: false
+        type: string
+        default: 'raphael_defconfig'
+      tree_defconfig:
+        description: "The kernel tree's own defconfig; used as the base when `defconfig` names a repo config file"
+        required: false
+        type: string
+        default: 'raphael_defconfig'
+      clang_url:
+        description: 'AOSP Clang prebuilt tarball (r522817 is load-bearing; other Clang bootloops per JOURNEY.md)'
+        required: false
+        type: string
+        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz'
+      localversion:
+        description: 'CONFIG_LOCALVERSION suffix'
+        required: false
+        type: string
+        default: '-Docker-CI'
+      stock_only:
+        description: 'true = build the tree UNMODIFIED (no docker.config, no injected fragment). A control: proves whether the tree itself boots the ROM before blaming our options.'
+        required: false
+        type: string
+        default: 'false'
+      enable_tracing:
+        description: 'true = add FTRACE/TRACING/UPROBE_EVENTS/BPF_EVENTS. Off by default: KameOS''s own working kernel has tracing entirely disabled, so this is NOT needed to satisfy bpfloader, and it breaks trees that never compiled with it.'
+        required: false
+        type: string
+        default: 'false'
+      bpf_attr_abi:
+        description: 'true = extend union bpf_attr to the modern layout so CHECK_ATTR accepts btf_fd/expected_attach_type (scripts/backport_bpf_attr.py). Isolate this to tell the ABI theory apart from the verifier theory.'
+        required: false
+        type: string
+        default: 'true'
+      bpf_devmap_hash:
+        description: 'true = make BPF_MAP_TYPE_DEVMAP_HASH creatable (scripts/backport_bpf_map_types.py). The one confirmed defect; keep on.'
+        required: false
+        type: string
+        default: 'true'
+      rdonly_prog_flag:
+        description: 'true = accept BPF_F_RDONLY_PROG/WRONLY_PROG on 4.14 maps (scripts/accept_rdonly_prog_flag.py). X3 showed tether_dev_map matching on type/key/value/entries and failing only on flags:128/0.'
+        required: false
+        type: string
+        default: 'false'
+      fake_uname:
+        description: 'Kernel release reported to bpfloader/netbpfload/netd only (scripts/fake_uname_bpfloader.py). netbpfload hard-refuses <4.19 -- "Android V requires kernel 4.19." -- which is the actual cause of reboot,bpfloader-failed. Empty = do not patch. Claiming a version also makes the loader attempt that version''s programs.'
+        required: false
+        type: string
+        default: ''
+      cgroup_attach_types:
+        description: 'true = declare BPF_CGROUP_UDP4/6_SENDMSG, UDP4/6_RECVMSG, GET/SETSOCKOPT and accept the sendmsg/recvmsg four for CGROUP_SOCK_ADDR (scripts/add_cgroup_attach_types.py). This is the exact thing rikka-v5 lacks: netbpfload loads everything up to netd.o and then EINVALs on recvmsg4_udp4_recvmsg.'
+        required: false
+        type: string
+        default: 'false'
+      cgroup_sockopt:
+        description: 'true = add BPF_PROG_TYPE_CGROUP_SOCKOPT (25) + struct bpf_sockopt so netd.o''s four-instruction getsockopt/setsockopt programs LOAD (scripts/add_cgroup_sockopt.py). Load-only: the runtime hooks are not wired up. Needs cgroup_attach_types=true.'
+        required: false
+        type: string
+        default: 'false'
+      xskmap_alias:
+        description: 'true = register BPF_MAP_TYPE_XSKMAP (17) against dev_map_ops and let bpf_redirect_map take it (scripts/alias_xskmap.py). Xiaomi''s osrtpPolicy.o creates mi_xsk_port_map unconditionally; without this the whole netd_shared directory fails even though netd.o loaded.'
+        required: false
+        type: string
+        default: 'false'
+      trace_printk_dummy:
+        description: 'true = make bpf_get_trace_printk_proto() return a no-op helper instead of NULL (scripts/add_trace_printk_dummy.py), the way KameOS''s own kernel does. Xiaomi''s non-optional osrtpPolicy.o XDP program calls helper 6, and without BPF_EVENTS the verifier rejects it.'
+        required: false
+        type: string
+        default: 'false'
+      trie_next_key:
+        description: 'true = implement trie_get_next_key() for LPM_TRIE maps (scripts/backport_trie_get_next_key.py). rikka-v5 stubs it to -ENOTSUPP, which makes NetworkStatsService throw on local_net_access and takes system_server down.'
+        required: false
+        type: string
+        default: 'false'
+      cgroup_device:
+        description: 'true = add BPF_PROG_TYPE_CGROUP_DEVICE (15) + BPF_CGROUP_DEVICE (6) so runc can query/load/attach its device program on cgroup v2 (scripts/add_cgroup_device.py). Without it `docker run` fails with bpf_prog_query(BPF_CGROUP_DEVICE): invalid argument. Load-only: device restrictions are NOT enforced.'
+        required: false
+        type: string
+        default: 'false'
+      brand_author:
+        description: 'Name credited in the boot banner and in CONFIG_LOCALVERSION.'
+        required: false
+        type: string
+        default: 'xiziphus'
+      bpf_graft_scope:
+        description: '"sockopt" = graft ONLY the sendmsg/recvmsg + cgroup-sockopt files (what Zundamon actually added to Rikka). "full" = the whole BPF subsystem.'
+        required: false
+        type: string
+        default: 'full'
+      bpf_donor:
+        description: 'Optional "<git-url>@<ref>" whose BPF subsystem is grafted over this tree (scripts/transplant_bpf.sh). Use to bring openela BPF to bool-x -- the direction that matches what KameOS actually is.'
+        required: false
+        type: string
+        default: ''
+      append_dtb:
+        description: 'Optional base dtb name (e.g. sm8150-v2.dtb) to concatenate onto Image.gz when the tree has no Image.gz-dtb target (5.4 GKI-style trees).'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      KERNEL_DIR: kernel
+      CLANG_DIR: /home/runner/clang
+      CCACHE_DIR: /home/runner/.ccache
+      KBUILD_BUILD_USER: xiziphus
+      KBUILD_BUILD_HOST: github-actions
+
+    steps:
+      - name: Checkout harness repo (docker.config + AnyKernel3/anykernel.sh)
+        uses: actions/checkout@v4
+
+      - name: Free up runner disk space
+        run: |
+          # GitHub runners ship ~14G free; the ThinLTO out/ tree + Clang need more.
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/graalvm /usr/local/share/powershell /usr/share/swift \
+            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/chromium /usr/local/share/boost 2>/dev/null || true
+          sudo apt-get clean
+          echo "after:"; df -h / | tail -1
+
+      - name: Install build dependencies
+        timeout-minutes: 8
+        run: |
+          # apt on the hosted runners hung indefinitely twice in a row (B3rk and
+          # B4rk both sat on this step for 25+ min while every later step stayed
+          # pending). The job timeout is 150 min, so a wedged apt burns two and a
+          # half hours before anything notices. Bound the step, and retry the
+          # update against a different mirror rather than failing the build.
+          for i in 1 2 3; do
+            sudo timeout 120 apt-get update && break
+            echo "apt-get update attempt $i failed/timed out; retrying"
+            sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+            sleep 5
+          done
+          # NOTE: do NOT install distro clang -- this tree must build with the AOSP
+          # prebuilt (r522817) or it bootloops. We only need binutils, host libs,
+          # the cross-gcc prefixes for CROSS_COMPILE, and packaging tools.
+          sudo timeout 300 apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev ccache \
+            lz4 zip unzip python3 cpio wget git \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libyaml-dev
+          # libyaml-dev: some trees (HeliumStudio's, and other newer dtc
+          # backports) build scripts/dtc with YAML output support. Without the
+          # library the host tool fails to link with a wall of
+          # "undefined reference to `yaml_emitter_emit'" before any kernel code
+          # is compiled.
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-raphael-${{ inputs.kernel_branch }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-raphael-${{ inputs.kernel_branch }}-
+            ccache-raphael-
+
+      - name: Fetch AOSP Clang r522817
+        run: |
+          mkdir -p "$CLANG_DIR"
+          echo "Downloading: ${{ inputs.clang_url }}"
+          curl -fL --retry 3 -o /tmp/clang.tar.gz "${{ inputs.clang_url }}"
+          tar -xzf /tmp/clang.tar.gz -C "$CLANG_DIR"
+          rm -f /tmp/clang.tar.gz
+          "$CLANG_DIR/bin/clang" --version | head -2
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            "${{ inputs.kernel_repo }}" "$KERNEL_DIR"
+
+          # Trees that carry KernelSU/SukiSU as a submodule clone empty, and then
+          # Kconfig dies with: can't open file "drivers/staging/kernelsu/kernel/Kconfig".
+          # Try to populate; if that fails, neutralise the dangling source lines so
+          # the tree still configures (we do not need KernelSU to test booting).
+          git -C "$KERNEL_DIR" submodule update --init --depth 1 --recursive 2>/dev/null || true
+          python3 "$GITHUB_WORKSPACE/scripts/fix_empty_submodule_kconfig.py" "$KERNEL_DIR"
+
+          # Same class of problem in Makefiles: obj-y pointing at an empty submodule.
+          for d in drivers/staging/kernelsu drivers/kernelsu; do
+            if [ -d "$KERNEL_DIR/$d" ] && [ -z "$(ls -A "$KERNEL_DIR/$d" 2>/dev/null)" ]; then
+              echo "  removing empty submodule dir $d"
+              rmdir "$KERNEL_DIR/$d" 2>/dev/null || true
+            fi
+          done
+          echo "--- kernel version ---"
+          make -s -C "$KERNEL_DIR" kernelversion 2>/dev/null || \
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' "$KERNEL_DIR/Makefile" | head -3
+
+      - name: Enable swap (ThinLTO ld.lld link is the RAM spike)
+        run: |
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /mnt/swapfile
+          if sudo fallocate -l 12G /mnt/swapfile; then
+            sudo chmod 600 /mnt/swapfile
+            sudo mkswap /mnt/swapfile
+            sudo swapon /mnt/swapfile || echo "swapon not permitted; continuing"
+          else
+            echo "swap alloc failed; continuing without extra swap"
+          fi
+          free -h
+
+      - name: Configure + build kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export ARCH=arm64 SUBARCH=arm64
+          export PATH="$CLANG_DIR/bin:$PATH"
+          export KBUILD_BUILD_USER KBUILD_BUILD_HOST
+
+          # Every make invocation below MUST use this identical variable set.
+          # Configuring with the host toolchain and then building with clang
+          # made Kconfig re-resolve at build time (`--silentoldconfig`) and
+          # silently drop dependency-gated options -- run 31884327458 passed
+          # its own "config OK" check and still shipped
+          # `# CONFIG_PID_NS is not set`. Same env for config and build.
+          MK=(O=out ARCH=arm64
+              CC="ccache clang"
+              CLANG_TRIPLE=aarch64-linux-gnu-
+              CROSS_COMPILE=aarch64-linux-gnu-
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+              CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+              LD=ld.lld AR=llvm-ar NM=llvm-nm
+              OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+              LLVM_IAS=1)
+
+          rm -rf out && mkdir -p out
+          [ -f scripts/setlocalversion ] && sed -i 's/-dirty//g' scripts/setlocalversion || true
+
+          # Backported dtc vs 4.14 host-tool plumbing.
+          # Some trees (HeliumStudio's) ship a newer scripts/dtc that builds
+          # yamltree.o and asks for the library via HOSTLDLIBS_dtc, but 4.14's
+          # scripts/Makefile.host only reads HOSTLOADLIBES_<target>. The object
+          # compiles, -lyaml is never passed, and the host tool dies with a wall
+          # of "undefined reference to `yaml_emitter_emit'" before any kernel
+          # code is built. Alias the old name to the new one.
+          if grep -q 'HOSTLDLIBS_dtc' scripts/dtc/Makefile 2>/dev/null \
+             && ! grep -q 'HOSTLOADLIBES_dtc' scripts/dtc/Makefile; then
+            echo 'aliasing HOSTLOADLIBES_dtc -> HOSTLDLIBS_dtc for 4.14 Makefile.host'
+            echo 'HOSTLOADLIBES_dtc := $(HOSTLDLIBS_dtc)' >> scripts/dtc/Makefile
+          fi
+
+          # Make the embedded config (and /proc/config.gz) tell the truth.
+          # Several raphael trees carry Sultan Alsawaf's "use the stock raphael
+          # config for /proc/config.gz" patch, which points config_data.gz at a
+          # checked-in defconfig instead of $(KCONFIG_CONFIG). SOVIET-ANDROID@16.0
+          # embeds raphael-vts_defconfig (4.14.226) into a 4.14.357 kernel, so the
+          # image reports '# CONFIG_PID_NS is not set' no matter what was built --
+          # which is exactly what fooled the 2026-08-17 investigation.
+          if grep -qE '^\$\(obj\)/config_data\.gz: arch/arm64/configs/' kernel/Makefile 2>/dev/null; then
+            echo "neutralising the /proc/config.gz decoy in kernel/Makefile:"
+            grep -nE '^\$\(obj\)/config_data\.gz:' kernel/Makefile
+            sed -i -E 's#^(\$\(obj\)/config_data\.gz:) arch/arm64/configs/[^ ]+#\1 $(KCONFIG_CONFIG)#' kernel/Makefile
+            grep -nE '^\$\(obj\)/config_data\.gz:' kernel/Makefile
+          fi
+
+          # Drop Makefile references to arch/arm64/kernel sources the tree
+          # deleted. bool-x removed perf_trace_counters.c and perf_trace_user.c
+          # but kept the `ifeq ($(CONFIG_TRACING),y)` rule that builds them.
+          # That is dormant while the tree ships FTRACE off, and becomes fatal
+          # the moment TRACING is enabled for BPF_EVENTS:
+          #   No rule to make target 'arch/arm64/kernel/perf_trace_counters.o'
+          # These are CAF perf-counter tracing extras, unrelated to BPF or
+          # Docker; perf_event.o is built separately outside the guard. Only
+          # objects whose .c is genuinely absent are removed, so trees that do
+          # ship them (Helium oss-base) are untouched.
+          for o in perf_trace_counters perf_trace_user; do
+            if [ ! -f "arch/arm64/kernel/$o.c" ] \
+               && grep -q "$o\.o" arch/arm64/kernel/Makefile 2>/dev/null; then
+              echo "dropping $o.o from arch/arm64/kernel/Makefile (source not in tree)"
+              sed -i -E "s/(^|[[:space:]])$o\.o//g" arch/arm64/kernel/Makefile
+            fi
+          done
+
+          # De-duplicate tracepoint instantiation. A trace header may be
+          # instantiated by exactly ONE .c: `#define CREATE_TRACE_POINTS` emits
+          # the __tracepoint_* objects, and every other user just includes the
+          # header for declarations. In drivers/soc/qcom/msm_bus/Makefile BOTH
+          # msm_bus_core.o (obj-y) and msm_bus_rules.o (obj-y, inside an enabled
+          # ifdef QCOM_BUS_CONFIG_RPMH) are built, and both instantiate
+          # trace_msm_bus.h. With tracing off the macros are no-ops and nothing
+          # collides; with TRACING=y (needed for BPF_EVENTS) ld.lld fails with
+          #   duplicate symbol: __tracepoint_bus_update_request   (+9 more)
+          # Strip the define from the non-core file so exactly one translation
+          # unit owns the symbols.
+          #
+          # ONLY list pairs where BOTH files genuinely compile. Learned the hard
+          # way: drivers/cpuidle's lpm-levels.c and lpm-levels-legacy.c also both
+          # instantiate trace_msm_low_power.h, but their Makefile is an
+          # ifeq(CONFIG_MSM_PM_LEGACY,y)/else, so they are mutually exclusive --
+          # only lpm-levels.c builds here. Adding that pair stripped the define
+          # from the sole compiled file and produced the mirror-image failure,
+          # "undefined symbol: __tracepoint_cluster_enter". Read the Makefile's
+          # conditionals; do not infer from which line mentions the object.
+          # Rest of the tree audited: the other multiply-instantiated headers are
+          # per-arch or config-disabled here (MSM_AIS, IPA v2, QCOM_SCM_QCPE,
+          # KVM/VIRTUALIZATION all off).
+          for pair in \
+            "drivers/soc/qcom/msm_bus/msm_bus_rules.c|drivers/soc/qcom/msm_bus/msm_bus_core.c|trace_msm_bus.h"; do
+            strip="${pair%%|*}"; rest="${pair#*|}"; keep="${rest%%|*}"; hdr="${rest##*|}"
+            if [ -f "$strip" ] && [ -f "$keep" ] \
+               && grep -q '^#define CREATE_TRACE_POINTS' "$strip" \
+               && grep -q '^#define CREATE_TRACE_POINTS' "$keep" \
+               && grep -q "$hdr" "$strip" && grep -q "$hdr" "$keep"; then
+              echo "tracepoints for $hdr owned by $keep; stripping CREATE_TRACE_POINTS from $strip"
+              sed -i '/^#define CREATE_TRACE_POINTS$/d' "$strip"
+            fi
+          done
+
+          # Make BPF_MAP_TYPE_DEVMAP_HASH (25) creatable. This is THE reason a
+          # bool-x kernel boots KameOS and then dies with
+          # `reboot,bpfloader-failed`: the ROM's own
+          # /apex/com.android.tethering/etc/bpf/tethering/offload.o is marked
+          # `critical` and declares tether_dev_map as type 25 with
+          # min_kver=0 -- ungated, so it must be created on 4.14 too. bool-x's
+          # map enum stops at 15:SOCKMAP, so creation returns EINVAL and
+          # bpfloader exits non-zero. No-op on the openela lineage, which
+          # already has types up to 25. See the script header for why nothing
+          # else was missing (program types, helpers, instruction set and the
+          # min_kver-gated 4.17-5.10 cgroup hooks all check out).
+          if [ -n "${{ inputs.bpf_donor }}" ]; then
+            DONOR="${{ inputs.bpf_donor }}"
+            BPF_GRAFT_SCOPE="${{ inputs.bpf_graft_scope }}" \
+              bash "$GITHUB_WORKSPACE/scripts/transplant_bpf.sh" "${DONOR%@*}" "${DONOR##*@}"
+          fi
+
+          if [ "${{ inputs.rdonly_prog_flag }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/accept_rdonly_prog_flag.py"
+          fi
+
+          if [ "${{ inputs.cgroup_attach_types }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/add_cgroup_attach_types.py"
+          fi
+
+          if [ "${{ inputs.cgroup_sockopt }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/add_cgroup_sockopt.py"
+          fi
+
+          if [ "${{ inputs.xskmap_alias }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/alias_xskmap.py"
+          fi
+
+          if [ "${{ inputs.trace_printk_dummy }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/add_trace_printk_dummy.py"
+          fi
+
+          if [ "${{ inputs.trie_next_key }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/backport_trie_get_next_key.py"
+          fi
+
+          if [ "${{ inputs.cgroup_device }}" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/add_cgroup_device.py"
+          fi
+
+          BRAND_AUTHOR="${{ inputs.brand_author }}" \
+            python3 "$GITHUB_WORKSPACE/scripts/brand_kernel.py"
+
+          if [ -n "${{ inputs.fake_uname }}" ]; then
+            FAKE_UNAME_RELEASE="${{ inputs.fake_uname }}" \
+              python3 "$GITHUB_WORKSPACE/scripts/fake_uname_bpfloader.py"
+          fi
+
+          if [ "${{ inputs.bpf_devmap_hash }}" != "false" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/backport_bpf_map_types.py"
+          else echo "  (DEVMAP_HASH backport SKIPPED by input)"; fi
+
+          # Let a modern netbpfload talk to this kernel's bpf() syscall at all.
+          # bool-x has a PARTIAL Android bpf_attr backport (map_name/prog_name/
+          # file_flags but no btf_fd/expected_attach_type/...), while
+          # kernel/bpf/syscall.c still says BPF_MAP_CREATE_LAST_FIELD=map_name.
+          # CHECK_ATTR() memchr_inv()s everything after LAST_FIELD up to
+          # sizeof(union bpf_attr) and returns EINVAL on any nonzero byte, so a
+          # loader that writes BTF metadata fails EVERY map creation regardless
+          # of map type -- which is why fixing DEVMAP_HASH changed nothing.
+          if [ "${{ inputs.bpf_attr_abi }}" != "false" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/backport_bpf_attr.py"
+          else echo "  (bpf_attr ABI backport SKIPPED by input)"; fi
+
+          # Reproduce KameOS's pstore geometry so a failed boot leaves a log we
+          # can actually read. The ROM does NOT take ramoops from the DT -- its
+          # cmdline carries `ramoops_memreserve=4M`, which a Xiaomi patch in
+          # fs/pstore/ram.c turns into a hardcoded 0xB0000000 region registered
+          # as a plain platform device. That is why there is no device-tree node
+          # for it and why every region we declared in DTS was invisible to the
+          # ROM's reader. The script installs that same mechanism and deletes any
+          # DT ramoops node so the two can't collide. After a failed test boot:
+          #   adb shell su -c 'dumpsys dropbox --print SYSTEM_LAST_KMSG'  (console)
+          #   adb shell su -c 'logcat -L -b all'                          (pmsg)
+          python3 "$GITHUB_WORKSPACE/scripts/xiaomi_ramoops.py"
+
+          # Assert the patches we asked for actually landed. Three times a
+          # patch script has reported "applied" while changing nothing, and the
+          # resulting kernel looked like a failed theory rather than a failed
+          # patch. Fail here instead.
+          WANT_FAKE_UNAME="${{ inputs.fake_uname }}" \
+          WANT_RDONLY_PROG="${{ inputs.rdonly_prog_flag }}" \
+          WANT_DEVMAP_HASH="${{ inputs.bpf_devmap_hash }}" \
+            python3 "$GITHUB_WORKSPACE/scripts/verify_patches.py"
+
+          ccache -M 15G >/dev/null 2>&1 || true; ccache -z >/dev/null 2>&1 || true
+
+          echo "=== base defconfig: ${{ inputs.defconfig }} ==="
+          DEF="${{ inputs.defconfig }}"
+          FRAGS=()
+          if [ -f "$GITHUB_WORKSPACE/$DEF" ]; then
+            # A full config lifted from another ROM's kernel (e.g. kameos_defconfig,
+            # extracted from KameOS's own image). It must be layered ON TOP of this
+            # tree's defconfig, never used as the base: a foreign config omits
+            # symbols this tree requires -- LITTLE_CPU_MASK/BIG_CPU_MASK/PRIME_CPU_MASK
+            # came out empty, Kconfig rejected the empty values, the symbols became
+            # NEW, and the build's silentoldconfig tried to prompt and aborted.
+            echo "layering repo config '$DEF' over ${{ inputs.tree_defconfig }}"
+            make "${MK[@]}" "${{ inputs.tree_defconfig }}"
+            FRAGS+=("$GITHUB_WORKSPACE/$DEF")
+          else
+            make "${MK[@]}" "$DEF"
+          fi
+
+          echo "=== merge fragments (ROM config, docker.config, ikconfig) ==="
+          # IKCONFIG is required so the built image carries its own config and
+          # the verify step below can inspect what was ACTUALLY compiled.
+          # IKCONFIG so the image carries its own config; plus raphael's CPU
+          # topology. LITTLE/BIG/PRIME_CPU_MASK are `int` symbols with NO
+          # default in arch/arm64/Kconfig. Trees whose defconfig omits them
+          # (hxsyzl@16.0-raphael) leave them NEW, so the build's silentoldconfig
+          # tries to prompt and dies with "(NEW) aborted!". The values are
+          # raphael's 4+3+1 layout, matching SOVIET's raphael_defconfig:
+          # 15 = cores 0-3, 112 = cores 4-6, 128 = core 7.
+          # KALLSYMS_ALL: emit a full symbol table so the built kernel can be
+          # compared against a ROM's own kernel with kallsyms-finder. KameOS's
+          # image yields 60801 real symbols -- the only trustworthy description
+          # of what it actually contains, since its embedded config is a decoy.
+          # Ours had no table at all ("0 candidates for kallsyms_token_table"),
+          # so there was nothing to diff against when hunting the boot failure.
+          cat > /tmp/ikconfig.config <<'FRAG'
+          CONFIG_LOCALVERSION="${{ inputs.localversion }}"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          CONFIG_IKCONFIG=y
+          CONFIG_IKCONFIG_PROC=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_LITTLE_CPU_MASK=15
+          CONFIG_BIG_CPU_MASK=112
+          CONFIG_PRIME_CPU_MASK=128
+          # --- PSTORE: without this a failed boot is SILENT ---
+          # Rikka's raphael_defconfig ships no PSTORE symbols at all, so two
+          # Rikka test boots wrote nothing to ramoops and looked like a DT bug
+          # in xiaomi_ramoops.py. It was not: the ram backend was never
+          # compiled in. bool-x and oss-base both enable these in-tree, which
+          # is why only Rikka went dark. Force them for every tree.
+          CONFIG_PSTORE=y
+          CONFIG_PSTORE_CONSOLE=y
+          CONFIG_PSTORE_PMSG=y
+          CONFIG_PSTORE_RAM=y
+          # --- BPF_EVENTS: required or Android will not boot on this kernel ---
+          # bpfloader is a `critical` init service. When it fails, init reboots
+          # and records `reboot,bpfloader-failed` in
+          # persist.sys.boot.reason.history -- exactly what a bool-x
+          # 16-HyperMiui build did on KameOS after otherwise booting fine
+          # (kernel up, init running: the furthest any custom kernel got).
+          FRAG
+          sed -i 's/^          //' /tmp/ikconfig.config
+
+          # Optional tracing block -- OFF by default, and deliberately so.
+          # The first theory for `reboot,bpfloader-failed` was a missing
+          # CONFIG_BPF_EVENTS, since Android 16 ships tracepoint BPF programs
+          # (timeInState.bpf, gpuWork.o, memevents). That theory is DISPROVEN:
+          # KameOS's own kernel boots and gets past bpfloader while containing
+          # no tracepoint name strings at all -- sched_switch, cpu_frequency
+          # and cgroup_attach_task are absent from the image -- i.e. it has
+          # FTRACE/TRACING entirely off. bpfloader therefore tolerates
+          # tracepoint programs it cannot load, and tracing is not required to
+          # boot. Enabling it also costs three separate build failures in trees
+          # that never compiled with it (deleted perf_trace_counters.c,
+          # duplicate __tracepoint_bus_*). Kept behind a flag purely as a
+          # debugging aid. FUNCTION_TRACER must stay off regardless -- that is
+          # the pairing that breaks binder_trace.h on these trees.
+          if [ "${{ inputs.enable_tracing }}" = "true" ]; then
+            echo "enable_tracing=true: adding FTRACE/UPROBES/BPF_EVENTS"
+            cat >> /tmp/ikconfig.config <<'TRACEFRAG'
+          CONFIG_FTRACE=y
+          # CONFIG_FUNCTION_TRACER is not set
+          # CONFIG_FTRACE_SYSCALLS is not set
+          # CONFIG_FTRACE_STARTUP_TEST is not set
+          CONFIG_UPROBES=y
+          CONFIG_UPROBE_EVENTS=y
+          CONFIG_BPF_EVENTS=y
+          TRACEFRAG
+            sed -i 's/^          //' /tmp/ikconfig.config
+          fi
+
+          # stock_only: build the tree with only the fragment the CI itself
+          # needs (IKCONFIG so the image is inspectable, and the CPU masks
+          # without which Kconfig aborts on NEW symbols) and NO docker.config.
+          # This is the control that separates "this tree cannot run this ROM"
+          # from "our Docker options broke it" -- worth one build before
+          # concluding anything about a boot failure.
+          if [ "${{ inputs.stock_only }}" = "true" ]; then
+            echo "=== stock_only: merging ONLY the CI fragment (no docker.config) ==="
+            ARCH=arm64 scripts/kconfig/merge_config.sh -m -O out out/.config \
+              "${FRAGS[@]}" /tmp/ikconfig.config
+          else
+            ARCH=arm64 scripts/kconfig/merge_config.sh -m -O out out/.config \
+              "${FRAGS[@]}" "$GITHUB_WORKSPACE/docker.config" /tmp/ikconfig.config
+          fi
+
+          echo "=== drop invalid/empty symbol values before Kconfig sees them ==="
+          # An empty value for a symbol this tree defines as non-empty makes the
+          # symbol NEW again, which is what aborts the build later.
+          sed -i -E '/^CONFIG_[A-Z0-9_]+=""$/d' out/.config
+
+          echo "=== olddefconfig (same env as the build) ==="
+          make "${MK[@]}" olddefconfig
+
+          echo "=== pre-build config check ==="
+          fail=0
+          if [ "${{ inputs.stock_only }}" = "true" ]; then
+            echo "stock_only: skipping the Docker-option check by design -- this"
+            echo "build is a boot control and is EXPECTED to lack them."
+          else
+            for o in NAMESPACES PID_NS NET_NS CGROUP_PIDS CGROUP_DEVICE POSIX_MQUEUE \
+                     OVERLAY_FS VETH BRIDGE NETFILTER_XT_MATCH_ADDRTYPE NF_NAT \
+                     PSTORE_RAM PSTORE_CONSOLE; do
+              grep -q "^CONFIG_${o}=y" out/.config || { echo "FATAL: CONFIG_${o} lost at config time"; fail=1; }
+            done
+          fi
+          if grep -q "^CONFIG_LLVM_POLLY=y" out/.config; then
+            echo "FATAL: LLVM_POLLY on -- build will hang"; fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+          echo "pre-build config OK (authoritative check runs on the built image)"
+
+          echo "=== build ==="
+          # ---- SMOKE GATE -------------------------------------------------
+          # Static preflight cannot catch compile errors, and every recent
+          # failure was one: implicit declarations from a BPF graft, a missing
+          # header, a nested block comment in a generated shim. Build the small
+          # set of subsystems our patches actually touch FIRST, so a broken
+          # patch costs ~4 minutes instead of ~17. Nothing here is wasted work:
+          # these objects are needed by the full build anyway.
+          echo "=== smoke: compiling patched subsystems first ==="
+          SMOKE_FAIL=0
+          for tgt in kernel/bpf/ kernel/sys.o fs/pstore/ net/core/; do
+            echo "--- smoke: $tgt"
+            if ! make -j"$(nproc)" "${MK[@]}" "$tgt" 2>&1 | tail -40; then
+              SMOKE_FAIL=1; break
+            fi
+          done
+          if [ "$SMOKE_FAIL" = "1" ]; then
+            echo
+            echo "SMOKE FAILED -- a patched subsystem does not compile."
+            echo "Fix the patch before spending the rest of the build."
+            exit 1
+          fi
+          echo "=== smoke passed; continuing to the full image ==="
+
+          if ! make -j"$(nproc)" "${MK[@]}" Image.gz-dtb; then
+            # 5.4/GKI-style trees have no appended-DTB target. raphael's
+            # bootloader still wants Image.gz with a base dtb concatenated;
+            # device overlays come from the dtbo partition.
+            APP="${{ inputs.append_dtb }}"
+            [ -n "$APP" ] || { echo "Image.gz-dtb failed and no append_dtb given"; exit 1; }
+            make -j"$(nproc)" "${MK[@]}" Image.gz
+            make -j"$(nproc)" "${MK[@]}" dtbs || true
+            BASE=$(find out/arch/arm64/boot/dts -name "$APP" | head -1)
+            if [ -z "$BASE" ]; then
+              # Nothing put it in dtb-y (msm trees gate the whole dts Makefile
+              # behind a MACH_* symbol). Ask kbuild for the file directly.
+              SRC=$(find arch/arm64/boot/dts -name "${APP%.dtb}.dts" | head -1)
+              [ -n "$SRC" ] || { echo "no source ${APP%.dtb}.dts anywhere in the tree"; exit 1; }
+              REL="${SRC#*/}"; REL="arch/arm64/boot/dts/${SRC#arch/arm64/boot/dts/}"
+              echo "dtb not in dtb-y; building ${REL%.dts}.dtb explicitly"
+              make -j"$(nproc)" "${MK[@]}" "${REL%.dts}.dtb" || true
+              BASE=$(find out/arch/arm64/boot/dts -name "$APP" | head -1)
+            fi
+            [ -n "$BASE" ] || { echo "append_dtb '$APP' not built; available:"; find out/arch/arm64/boot/dts -name '*.dtb' | head -20; exit 1; }
+            cat out/arch/arm64/boot/Image.gz "$BASE" > out/arch/arm64/boot/Image.gz-dtb
+            echo "appended $BASE -> Image.gz-dtb"
+          fi
+
+          IMG=out/arch/arm64/boot/Image.gz-dtb
+          [ -f "$IMG" ] || { echo "ERROR: $IMG not produced"; exit 1; }
+          ls -lh "$IMG"
+          ccache -s | grep -iE 'hit rate|cache size' || true
+
+      - name: Verify the COMPILED image (authoritative)
+        run: |
+          # Reads the config embedded inside the built kernel -- the only check
+          # that cannot be invalidated by a later Kconfig re-resolution.
+          if [ "${{ inputs.stock_only }}" = "true" ]; then
+            # A stock control build has no Docker options on purpose; still dump
+            # the embedded config so the image stays inspectable.
+            python3 scripts/verify_kernel_config.py \
+              kernel/out/arch/arm64/boot/Image.gz-dtb \
+              --dump built-kernel.config --require '' || true
+            echo "stock_only: Docker options intentionally absent (boot control)"
+          else
+            python3 scripts/verify_kernel_config.py \
+              kernel/out/arch/arm64/boot/Image.gz-dtb \
+              --dump built-kernel.config
+          fi
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git
+          # use this repo's raphael-customised anykernel.sh (device check, block=boot)
+          cp "$GITHUB_WORKSPACE/AnyKernel3/anykernel.sh" ak3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb ak3/Image.gz-dtb
+          NAME="raphael-docker-kernel-${{ inputs.kernel_branch }}-$(date +%Y%m%d).zip"
+          ( cd ak3 && zip -r9 "../$NAME" . -x '.git*' 'README.md' >/dev/null )
+          echo "ZIP_NAME=$NAME" >> "$GITHUB_ENV"
+          ls -lh "$NAME"
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: raphael-docker-kernel
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+
+      - name: Upload raw image + .config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raphael-image-and-config
+          path: |
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out/.config
+            built-kernel.config
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: ignore

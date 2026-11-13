@@ -1,0 +1,147 @@
+# Build artifacts
+out/
+*.o
+*.ko
+*.mod.c
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+*.log
+
+# Kernel images (keep release/ folder)
+*.img
+!release/*.img
+*.gz
+!release/*.gz
+*.dtb
+*.dtbo
+
+# Backup files
+*~
+*.swp
+*.bak
+*.orig
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Archives (user can delete)
+archive/
+
+# Toolchains (too large for git)
+clang-*/
+gcc-*/
+*.tar.gz
+*.zip
+
+# Disk images
+*.dmg
+*.sparseimage
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Config files (keep docker.config)
+.config
+.config.old
+defconfig
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+
+# Build logs
+*.log
+!release/*.log
+
+# Large source directories (link instead)
+kernel_source/
+soviet_kernel_stock/
+
+# Build environment kept inside the repo folder (see scripts/build-env.sh).
+# build.sparseimage is a case-sensitive APFS image holding the kernel tree and
+# toolchain — this volume is exFAT and cannot host a Linux source tree itself.
+# (*.sparseimage is already covered under "Disk images" above.)
+toolchain/
+backups/
+logs/
+
+# Saved build artifacts (builds/<kernel.release>/). Each holds a 13 MB
+# Image.gz-dtb plus the .config and log that produced it. Kept out of git for
+# size; promote one to release/ deliberately if it is worth shipping.
+# MANIFEST.md in each is tracked so provenance survives without the binary.
+# NB: must be builds/*/* not builds/* -- the latter only matches one level down,
+# so the files inside each build directory would escape it. Git also cannot
+# re-include a file whose parent directory is excluded, so the directories
+# themselves are deliberately left un-ignored.
+builds/*/*
+!builds/*/MANIFEST.md
+!builds/*/SHA256SUMS
+
+# InfinityX device capture: keep the config and header text (small, valuable);
+# the ramdisk/dtb are binaries pulled from the device.
+infinityx/*.gz
+infinityx/boot_extracted/ramdisk.cpio.gz
+infinityx/boot_extracted/dtb
+state-mirror/
+raphael-state/
+
+# ---------------------------------------------------------------------------
+# Artifacts and working copies from the InfinityX / Docker-kernel work.
+# The distributable module and its source now live in a separate repo:
+#   https://github.com/xiziphus/raphael-docker-kernel
+# Keeping build output and a nested clone out of this tree; the sources that
+# produce them are tracked.
+# ---------------------------------------------------------------------------
+# builds/ is 1.5 GB of test images (54 of them at last count) -- still ignored.
+# builds/release/ is the carve-out: provenance is tracked, binaries are not.
+# The binaries go to GitHub Releases, which is where 13 MB blobs belong.
+# Note the boot.img embeds a Magisk-patched ramdisk (device state), so the
+# AnyKernel zip -- kernel only -- is the artifact to publish by preference.
+builds/*
+!builds/release/
+builds/release/*
+!builds/release/MANIFEST.md
+!builds/release/SHA256SUMS
+dist/
+module/
+repo-mirror/
+state-mirror/
+raphael-state/
+backups/
+infinityx/boot_extracted/
+
+# AnyKernel3 is vendored by cloning osm0sis/AnyKernel3 into AnyKernel3/,
+# preserving our customised anykernel.sh. Track only that file.
+AnyKernel3/*
+!AnyKernel3/anykernel.sh
+
+# Qubo app DB - contains live MQTT credentials and device security keys
+qubo/
+
+# --- exFAT / VS Code performance -------------------------------------------
+# This volume is a userspace filesystem (fskitd + UVFSService), so every stat()
+# is an XPC round-trip. VS Code runs `git add -A` here on a timer; these two
+# entries are 98% of the 36,824 files git would otherwise walk.
+node_modules/
+
+# macOS side-cars xattrs into ._* files because exFAT has none. 19,300 of them.
+# The ones under .git/objects/pack/ are also what produce the recurring
+# "non-monotonic index ._pack-*.idx" errors — git tries to read them as packs.
+._*
+.DS_Store
+builds/ramdisk-magisk.cpio.gz

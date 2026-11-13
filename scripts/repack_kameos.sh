@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Repack a built Image.gz-dtb into a KameOS-bootable boot.img for `fastboot boot`.
+#
+# Usage: scripts/repack_kameos.sh <Image.gz-dtb> <ktest-name> [out.img]
+#
+# Two things here are load-bearing and were each learned the hard way:
+#
+#   ramoops_memreserve=4M
+#     KameOS's kernel gets this from its own built-in CONFIG_CMDLINE, NOT from
+#     the boot header -- the stock header's cmdline does not contain it. Our
+#     kernels therefore never received it, so the vendor pstore mechanism
+#     (scripts/xiaomi_ramoops.py) stayed dormant and every failed boot was
+#     silent. Adding it here is what turns the log channel on.
+#
+#   androidboot.ktest=<name>
+#     Surfaces as ro.boot.ktest. Without a marker a failed `fastboot boot` is
+#     indistinguishable from a success, because both end up reporting the
+#     flashed kernel's version.
+#
+# Header fields are KameOS's own (os_version 13.0.0 / patch 2022-11); do not
+# "fix" them to the ROM's advertised Android version -- FBE key derivation uses
+# these bytes and a mismatch costs you the data partition.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${1:?usage: repack_kameos.sh <Image.gz-dtb> <ktest-name> [out.img]}"
+KTEST="${2:?need a ktest marker name}"
+OUT="${3:-$REPO/builds/boot-${KTEST}.img}"
+
+STOCK="$REPO/builds/kameos-docker-20260804-024211/boot-kameos-stock.img"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# raphael boots system-as-root: without this the kernel ignores the initramfs,
+# magiskinit never runs, and the device comes up rootless and silent about it.
+cp "$IMAGE" "$WORK/Image.gz-dtb"
+python3 "$REPO/scripts/want_initramfs.py" "$WORK/Image.gz-dtb"
+IMAGE="$WORK/Image.gz-dtb"
+
+python3 "$REPO/scripts/unpack_boot.py" "$STOCK" "$WORK" >/dev/null
+
+# Prefer a Magisk-patched ramdisk when one has been captured. The stock
+# KameOS ramdisk gives a test kernel no root, and every interesting thing to
+# do with a kernel that finally boots -- reading pstore, starting dockerd,
+# mounting cgroups -- needs `su`. Capture it once with:
+#   adb shell su -c 'dd if=/dev/block/by-name/boot of=/data/local/tmp/b.img'
+#   adb pull /data/local/tmp/b.img && python3 scripts/unpack_boot.py b.img o/
+#   cp o/ramdisk.cpio.gz builds/ramdisk-magisk.cpio.gz
+# Header fields are identical between the two (os_version 13.0.0,
+# patch 2022-11, pagesize 4096), so only the ramdisk changes.
+RAMDISK="$WORK/ramdisk.cpio.gz"
+if [ -f "$REPO/builds/ramdisk-magisk.cpio.gz" ]; then
+  RAMDISK="$REPO/builds/ramdisk-magisk.cpio.gz"
+  echo "  ramdisk      : Magisk-patched (root available on the test kernel)"
+else
+  echo "  ramdisk      : stock (NO ROOT on the test kernel)"
+fi
+CMDLINE="$(python3 - "$WORK/boot_params.txt" <<'PY'
+import re,sys
+print(re.search(r'Cmdline:\s*(.*)', open(sys.argv[1]).read()).group(1).strip())
+PY
+)"
+# ignore_loglevel: netbpfload logs through base::KernelLogger, i.e. /dev/kmsg
+# at KERN_INFO. Rikka's console_loglevel drops that, so its pstore console
+# recorded init's "bpfloader ... failed" line and NOT the NetBpfLoad lines
+# that say WHY -- the log looked complete while missing the only part that
+# matters. bool-x happened to ship a higher default and hid the problem.
+# QUIET_LOG=1 drops the two verbose flags. They are what makes netbpfload's
+# reasoning visible, but they also fill the 2 MB pstore console in ~2 s, so the
+# FIRST-stage boot (magiskinit, init first stage, sepolicy load) wraps out of
+# the buffer. Use QUIET_LOG=1 when the question is about early boot instead.
+if [ "${QUIET_LOG:-0}" = "2" ]; then
+  # Keep devkmsg so USERSPACE writes to /dev/kmsg (magiskinit logs there) are
+  # recorded, but drop the kernel's own flood so the 2 MB buffer covers boot.
+  CMDLINE="$CMDLINE ramoops_memreserve=4M printk.devkmsg=on androidboot.ktest=$KTEST"
+elif [ "${QUIET_LOG:-0}" = "1" ]; then
+  CMDLINE="$CMDLINE ramoops_memreserve=4M androidboot.ktest=$KTEST"
+else
+  CMDLINE="$CMDLINE ramoops_memreserve=4M loglevel=8 ignore_loglevel printk.devkmsg=on androidboot.ktest=$KTEST"
+fi
+
+mkdir -p "$(dirname "$OUT")"
+python3 "$REPO/mkbootimg_src/mkbootimg.py" \
+  --kernel "$IMAGE" \
+  --ramdisk "$RAMDISK" \
+  --cmdline "$CMDLINE" \
+  --header_version 0 \
+  --os_version 13.0.0 --os_patch_level 2022-11 \
+  --pagesize 4096 --base 0x00000000 \
+  --kernel_offset 0x00008000 --ramdisk_offset 0x00000000 --tags_offset 0x00000100 \
+  --output "$OUT"
+
+echo "wrote $OUT"
+echo "  ktest marker : $KTEST"
+echo "  cmdline len  : ${#CMDLINE}"
+echo
+echo "Test (non-destructive, does not touch the boot partition):"
+echo "  adb reboot bootloader && fastboot boot \"$OUT\""
+echo "On raphael a FAILED fastboot boot powers the device OFF -- press power to bring it back."
+echo "After it fails and you are back in KameOS, read the log:"
+echo "  adb shell su -c 'logcat -L -b all' | grep -iE 'bpf|netbpf'"
+echo "  adb shell su -c 'dumpsys dropbox --print SYSTEM_LAST_KMSG' | tail -80"
