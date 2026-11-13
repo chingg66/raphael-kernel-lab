@@ -474,6 +474,13 @@ jobs:
           CONFIG_LITTLE_CPU_MASK=15
           CONFIG_BIG_CPU_MASK=112
           CONFIG_PRIME_CPU_MASK=128
+          # --- SDCARD_FS: this ROM mounts /mnt/runtime/* as sdcardfs ---
+          # Verified on device 5d671bc5 while running the ROM's own kernel:
+          #   mount -> /data/media on /mnt/runtime/default/emulated type sdcardfs
+          # SOVIET ships fs/sdcardfs/ but its defconfig does not enable it, so a
+          # stock control build loses /storage/emulated. Enabling it is a ROM
+          # requirement, not a Docker option.
+          CONFIG_SDCARD_FS=y
           # --- LLVM_POLLY: raphael_defconfig turns it ON and the build HANGS ---
           # Polly's ISL solver is exponential worst-case; qca-wifi-host-cmn's
           # reg_build_chan_list.c (1245 lines) ran 20+ min at 99% CPU and never
