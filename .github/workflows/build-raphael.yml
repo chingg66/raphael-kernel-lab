@@ -122,6 +122,16 @@ on:
         required: false
         type: string
         default: ''
+      sukisu:
+        description: 'true = replace the in-tree KernelSU-Next driver with SukiSU-Ultra (the layout the SUSFS patches were written against) before building. Spike only: the defconfig still carries CONFIG_KSU_MANUAL_HOOK, so treat KSU as experimental.'
+        required: false
+        type: string
+        default: 'false'
+      susfs:
+        description: 'true = after the SukiSU swap, apply patches/10_susfs_ksu_gki.patch + patches/50_susfs_kernel_4.14.patch and turn on the CONFIG_KSU_SUSFS* options. Implies sukisu.'
+        required: false
+        type: string
+        default: 'false'
 
 jobs:
   build:
@@ -218,6 +228,14 @@ jobs:
           echo "--- kernel version ---"
           make -s -C "$KERNEL_DIR" kernelversion 2>/dev/null || \
             grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' "$KERNEL_DIR/Makefile" | head -3
+
+      - name: Swap in SukiSU-Ultra driver (+ optional SUSFS patches)
+        if: inputs.sukisu == 'true' || inputs.susfs == 'true'
+        run: |
+          set -euo pipefail
+          MODE=swap
+          if [ "${{ inputs.susfs }}" = "true" ]; then MODE=susfs; fi
+          bash "$GITHUB_WORKSPACE/scripts/setup_sukisu.sh" "$KERNEL_DIR" "$MODE"
 
       - name: Enable swap (ThinLTO ld.lld link is the RAM spike)
         run: |
@@ -526,6 +544,31 @@ jobs:
           # (kernel up, init running: the furthest any custom kernel got).
           FRAG
           sed -i 's/^          //' /tmp/ikconfig.config
+
+          # SukiSU hooks via kprobes; the bundled KernelSU-Next used manual hooks.
+          if [ "${{ inputs.sukisu }}" = "true" ] || [ "${{ inputs.susfs }}" = "true" ]; then
+            cat >> /tmp/ikconfig.config <<'KROBEFRAG'
+          CONFIG_KPROBES=y
+          KROBEFRAG
+          fi
+          if [ "${{ inputs.susfs }}" = "true" ]; then
+            cat >> /tmp/ikconfig.config <<'SUSFSFRAG'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          SUSFSFRAG
+          fi
 
           # Optional tracing block -- OFF by default, and deliberately so.
           # The first theory for `reboot,bpfloader-failed` was a missing
