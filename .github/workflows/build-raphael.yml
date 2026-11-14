@@ -502,6 +502,10 @@ jobs:
           CONFIG_IKCONFIG=y
           CONFIG_IKCONFIG_PROC=y
           CONFIG_KALLSYMS=y
+          # KALLSYMS_ALL depends on DEBUG_KERNEL in kernel/Kconfig.debug, so it
+          # was being dropped silently; without it sys_call_table is missing
+          # and KSU MANUAL_HOOK never patches it (su invisible to every uid).
+          CONFIG_DEBUG_KERNEL=y
           CONFIG_KALLSYMS_ALL=y
           CONFIG_LITTLE_CPU_MASK=15
           CONFIG_BIG_CPU_MASK=112
@@ -528,11 +532,8 @@ jobs:
           # blk-mq schedulers: Kconfig says y yet the built .config has neither.
           CONFIG_MQ_IOSCHED_DEADLINE=y
           CONFIG_MQ_IOSCHED_KYBER=y
-          # SCSI_MQ_DEFAULT: TRIED AND REVERTED -- the phone hung on boot with
-          # no USB at all (run 43462957648, boot_feat2.img, 2026-11-14), i.e.
-          # the UFS queue never came up on blk-mq in this 4.14 tree. mq-deadline
-          # and kyber can register but sda cannot be moved off the legacy
-          # elevator path. Do not re-enable without fixing ufs-qcom's blk-mq.
+          # SCSI_MQ_DEFAULT: TRIED AND REVERTED (run 43462957648) -- UFS never
+          # came up on blk-mq, no USB, hung boot. Do not re-enable.
           # BPF_EVENTS: bpfloader is critical; without it init reboots with
           # `reboot,bpfloader-failed`.
           FRAG
