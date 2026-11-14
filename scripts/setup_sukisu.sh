@@ -54,6 +54,22 @@ if [ "$MODE" = "susfs" ]; then
         -i "$WS/patches/$p" ) || true
   done
 
+  # 50_add_susfs_in_kernel-4.14.patch only touches EXISTING files. The new
+  # translation units and headers ship as loose files and have to be copied in by
+  # hand -- README steps 4 and 5. Forgetting this is what broke run 43549271034:
+  # fs/stat.o died on `linux/susfs_def.h: No such file or directory` while every
+  # patch reported success, because a patch that adds an #include is "clean".
+  echo "-- copying SUSFS companion sources (fs/*, include/linux/*) --"
+  for f in fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h include/linux/sus_su.h; do
+    if [ ! -f "$WS/patches/susfs_4.14/$f" ]; then
+      echo "FATAL: missing $WS/patches/susfs_4.14/$f" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$KDIR/$f")"
+    cp -f "$WS/patches/susfs_4.14/$f" "$KDIR/$f"
+  done
+  ls -l "$KDIR/fs/susfs.c" "$KDIR/fs/sus_su.c" "$KDIR/include/linux/susfs_def.h"
+
   echo "-- reject files --"
   if find "$KDIR" -name '*.rej' -print -quit | grep -q .; then
     find "$KDIR" -name '*.rej' | sed "s|^$KDIR/||" | sort
