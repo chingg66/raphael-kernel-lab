@@ -525,10 +525,7 @@ jobs:
           # CONFIG_ZRAM_DEF_COMP_LZ4 is not set
           CONFIG_ZRAM_DEF_COMP_ZSTD=y
           CONFIG_CRYPTO_LZ4HC=y
-          # --- blk-mq IO schedulers ---
-          # block/Kconfig.iosched defaults these to y, yet the built .config has
-          # neither ("noop [cfq]" is all the UFS queue offers). Enabling them
-          # gives mq-deadline and kyber, the two that actually suit flash.
+          # blk-mq schedulers: Kconfig says y yet the built .config has neither.
           CONFIG_MQ_IOSCHED_DEADLINE=y
           CONFIG_MQ_IOSCHED_KYBER=y
           # SCSI_MQ_DEFAULT: TRIED AND REVERTED -- the phone hung on boot with
@@ -536,38 +533,15 @@ jobs:
           # the UFS queue never came up on blk-mq in this 4.14 tree. mq-deadline
           # and kyber can register but sda cannot be moved off the legacy
           # elevator path. Do not re-enable without fixing ufs-qcom's blk-mq.
-          # --- BPF_EVENTS: required or Android will not boot on this kernel ---
-          # bpfloader is a `critical` init service. When it fails, init reboots
-          # and records `reboot,bpfloader-failed` in
-          # persist.sys.boot.reason.history -- exactly what a bool-x
-          # 16-HyperMiui build did on KameOS after otherwise booting fine
-          # (kernel up, init running: the furthest any custom kernel got).
+          # BPF_EVENTS: bpfloader is critical; without it init reboots with
+          # `reboot,bpfloader-failed`.
           FRAG
           sed -i 's/^          //' /tmp/ikconfig.config
 
-          # SukiSU hooks via kprobes; the bundled KernelSU-Next used manual hooks.
+          # SukiSU needs kprobes; the SUSFS symbols live in the helper script so
+          # this run block stays under GitHub's 21k expression limit.
           if [ "${{ inputs.sukisu }}" = "true" ] || [ "${{ inputs.susfs }}" = "true" ]; then
-            cat >> /tmp/ikconfig.config <<'KROBEFRAG'
-          CONFIG_KPROBES=y
-          KROBEFRAG
-          fi
-          if [ "${{ inputs.susfs }}" = "true" ]; then
-            cat >> /tmp/ikconfig.config <<'SUSFSFRAG'
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_MAP=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          SUSFSFRAG
+            bash "$GITHUB_WORKSPACE/scripts/sukisu_extra_config.sh" "${{ inputs.susfs }}" >> /tmp/ikconfig.config
           fi
 
           # Optional tracing block -- OFF by default, and deliberately so.
