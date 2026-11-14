@@ -452,6 +452,13 @@ jobs:
           # userspace tuner can ever touch them. Rebuild the table with 0644.
           python3 "$GITHUB_WORKSPACE/scripts/fix_sysctl_mode.py"
 
+          # This tree hooks ksu_handle_stat() only in fstatat64 (the 32-bit compat
+          # syscall). arm64 userspace uses newfstatat, so `stat("/system/bin/su")`
+          # returns ENOENT, the shell stops there, and execve() -- which IS hooked
+          # -- is never reached. Symptom: KernelSU fully up, allowlist granting uid
+          # 2000 root, and `su` still "does not exist". See fix_ksu_stat_hook.py.
+          python3 "$GITHUB_WORKSPACE/scripts/fix_ksu_stat_hook.py"
+
           # Assert the patches we asked for actually landed. Three times a
           # patch script has reported "applied" while changing nothing, and the
           # resulting kernel looked like a failed theory rather than a failed
